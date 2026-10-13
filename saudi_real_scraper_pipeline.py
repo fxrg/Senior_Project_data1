@@ -417,18 +417,20 @@ def detect_language_type(text: str) -> str:
 # =====================================================================
 # 5. محرك السكرابنق الفعلي من منصات التوظيف في السعودية
 # =====================================================================
-def run_real_saudi_scraping(results_per_query: int = 80) -> list:
+def run_real_saudi_scraping(existing_urls: set, results_per_query: int = 40) -> list:
     scraped_records = []
+    # مجموعة لتتبع الروابط الجديدة في نفس الجولة أيضاً
+    seen_urls_in_run = set(existing_urls)
 
     for search_term, fallback_role in SAUDI_SEARCH_QUERIES:
-        logging.info(f"جاري سحب الإعلانات الحقيقية من السعودية لـ: '{search_term}' ...")
+        logging.info(f"جاري فحص الإعلانات لـ: '{search_term}' ...")
         try:
             df_jobs = scrape_jobs(
                 site_name=["linkedin", "indeed", "bayt", "google"],
                 search_term=search_term,
                 location="Saudi Arabia",
                 results_wanted=results_per_query,
-                hours_old=1440,  # آخر 60 يوم لجلب أكبر عدد ممكن من الإعلانات الحقيقية
+                hours_old=48,  # خله 48 ساعة للتشغيل اليومي عشان يجيب الجديد بس
                 country_indeed="saudi arabia",
                 linkedin_fetch_description=True
             )
@@ -437,18 +439,22 @@ def run_real_saudi_scraping(results_per_query: int = 80) -> list:
                 continue
 
             for _, row in df_jobs.iterrows():
+                job_url = str(row.get("job_url") or "").strip()
+
+                # 1. منع التكرار: إذا الرابط مكرر أو فاضي، نتخطاه فوراً
+                if not job_url or job_url in seen_urls_in_run:
+                    continue
+
                 raw_title = str(row.get("title") or "").strip()
                 company = str(row.get("company") or "Saudi Employer").strip()
                 raw_loc = str(row.get("location") or "Saudi Arabia").strip()
                 raw_desc = str(row.get("description") or "").strip()
-                job_url = str(row.get("job_url") or "").strip()
                 site = str(row.get("site") or "JobPortal").strip()
 
-                # استخراج المهارات الحقيقية فقط من عنوان ووصف الوظيفة المسحوبة
+                # استخراج المهارات
                 full_text = f"{raw_title} {raw_desc}"
                 real_extracted_skills = extract_real_skills_from_text(full_text)
 
-                # استبعاد أي إعلان لا يحتوي على مهارات تقنية حقيقية واضحة (بدون أي ترقيع عشوائي)
                 if len(real_extracted_skills) == 0:
                     continue
 
@@ -457,7 +463,7 @@ def run_real_saudi_scraping(results_per_query: int = 80) -> list:
                 city = normalize_saudi_city(raw_loc)
                 lang_type = detect_language_type(full_text)
 
-                # التعامل مع الراتب إن وجد في الإعلان أو وضع النطاق التقديري للسوق السعودي
+                # معالجة الراتب
                 min_amt = row.get("min_amount")
                 max_amt = row.get("max_amount")
                 if pd.notna(min_amt) and float(min_amt) > 0:
@@ -465,8 +471,10 @@ def run_real_saudi_scraping(results_per_query: int = 80) -> list:
                 else:
                     salary_info = f"{sal_min} - {sal_max} (Market Est.)"
 
-                # مطابقة الشهادات الاحترافية المعتمدة بناءً على المهارات الفعلية المستخرجة
                 matched_certs = match_accredited_certificates(std_role, real_extracted_skills)
+
+                # تسجيل الإعلان الجديد وإضافة الرابط للمجموعة لتجنب تكراره في كويري ثاني
+                seen_urls_in_run.add(job_url)
 
                 scraped_records.append({
                     "standardized_role_en": std_role,
@@ -486,12 +494,12 @@ def run_real_saudi_scraping(results_per_query: int = 80) -> list:
                     "job_description": raw_desc[:2500]
                 })
 
-            logging.info(f"تم استخراج وتصفية الإعلانات الصالحة لـ '{search_term}' (الإجمالي حتى الآن: {len(scraped_records)})")
-            time.sleep(2.5)  # لتجنب حظر الـ IP أثناء السحب المستمر
+            logging.info(f"تمت تصفية الإعلانات لـ '{search_term}' (سجلات جديدة مستخرجة: {len(scraped_records)})")
+            time.sleep(2)
 
         except Exception as e:
-            logging.warning(f"تخطي خطأ مؤقت أثناء سحب '{search_term}': {e}")
-            time.sleep(3)
+            logging.warning(f"تخطي خطأ في '{search_term}': {e}")
+            time.sleep(2)
 
     return scraped_records
 
@@ -531,33 +539,37 @@ def compute_dynamic_market_top_skills(df: pd.DataFrame) -> pd.DataFrame:
 # =====================================================================
 # 7. الدمج، إزالة التكرار، والحفظ في CSV + SQLite
 # =====================================================================
-def execute_pipeline(results_per_query: int = 80):
+def execute_pipeline(results_per_query: int = 40):
     logging.info("=== بدء تشغيل السكرابر الفعلي لسوق العمل السعودي ===")
 
     existing_df = pd.DataFrame()
+    existing_urls = set()
+
+    # جلب الروابط المحفوظة مسبقاً
     if os.path.exists(MASTER_CSV_PATH):
-        existing_df = pd.read_csv(MASTER_CSV_PATH)
-        logging.info(f"تم تحميل الداتاسيت السابقة ({len(existing_df)} إعلان حقيقي).")
+        try:
+            existing_df = pd.read_csv(MASTER_CSV_PATH)
+            if "job_url" in existing_df.columns:
+                existing_urls = set(existing_df["job_url"].dropna().astype(str).tolist())
+            logging.info(f"تم تحميل {len(existing_df)} سجل سابق، منها {len(existing_urls)} رابط مميز.")
+        except Exception as e:
+            logging.warning(f"تعذر قراءة الملف السابق: {e}")
 
-    new_records = run_real_saudi_scraping(results_per_query=results_per_query)
-    new_df = pd.DataFrame(new_records)
+    # السحب مع استبعاد الروابط السابقة مسبقاً
+    new_records = run_real_saudi_scraping(existing_urls=existing_urls, results_per_query=results_per_query)
 
-    if not existing_df.empty and not new_df.empty:
-        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-    elif not new_df.empty:
-        combined_df = new_df
-    else:
-        combined_df = existing_df
-
-    if combined_df.empty:
-        logging.warning("لم يتم سحب بيانات جديدة في هذه الجولة.")
+    if not new_records:
+        logging.info("لا توجد إعلانات وظائف جديدة اليوم. انتهت العملية بدون تعديل.")
         return
 
-    # إزالة الإعلانات المكررة
-    combined_df.drop_duplicates(subset=["job_title_raw", "company_name", "city", "extracted_skills"], inplace=True)
+    new_df = pd.DataFrame(new_records)
+    combined_df = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
+
+    # إزالة تكرار نهائية كطبقة حماية إضافية بالاعتماد على الرابط
+    combined_df.drop_duplicates(subset=["job_url"], keep="first", inplace=True)
     combined_df.reset_index(drop=True, inplace=True)
 
-    # تحديث أكثر المهارات طلباً في السوق السعودي لكل وظيفة بناءً على كامل الداتا المتجمعة
+    # تحديث التحليلات المتقدمة والـ IDs
     combined_df = compute_dynamic_market_top_skills(combined_df)
     combined_df["record_id"] = [f"SA-REAL-{i+1:05d}" for i in range(len(combined_df))]
 
@@ -571,10 +583,10 @@ def execute_pipeline(results_per_query: int = 80):
     ]
     combined_df = combined_df[cols_order]
 
-    # 1. حفظ الداتاسيت الشاملة في ملف CSV واحد
+    # حفظ النتائج
     combined_df.to_csv(MASTER_CSV_PATH, index=False, encoding="utf-8-sig")
 
-    # 2. حفظ الداتاسيت + جدول الشهادات الكامل في SQLite
+    # حفظ الشهادات والداتابيز
     certs_df = pd.DataFrame([
         {
             "cert_code": c["code"],
@@ -591,15 +603,14 @@ def execute_pipeline(results_per_query: int = 80):
         combined_df.to_sql("saudi_career_master", conn, if_exists="replace", index=False)
         certs_df.to_sql("accredited_certificates_catalog", conn, if_exists="replace", index=False)
 
-    logging.info(f"تم الحفظ بنجاح! إجمالي الإعلانات الحقيقية في {MASTER_CSV_PATH}: {len(combined_df)} سجل.")
-    logging.info(f"تم حفظ {len(certs_df)} شهادة احترافية معتمدة في قاعدة البيانات {SQLITE_DB_PATH}.")
-
-
+    logging.info(f"تم التحديث بنجاح! الإجمالي الجديد: {len(combined_df)} سجل (تمت إضافة {len(new_records)} وظيفة جديدة).")
+    
+    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Autonomous Real Saudi Tech Job Scraper")
     parser.add_argument("--daemon", action="store_true", help="تشغيل مستمر تلقائياً على السيرفر كل عدة ساعات")
     parser.add_argument("--interval-hours", type=int, default=12, help="عدد الساعات بين كل عملية سحب تلقائية")
-    parser.add_argument("--limit", type=int, default=80, help="عدد النتائج المطلوبة لكل مسمى في كل جولة")
+    parser.add_argument("--limit", type=int, default=40, help="عدد النتائج المطلوبة لكل مسمى في كل جولة")
     args = parser.parse_args()
 
     if args.daemon:
@@ -609,4 +620,4 @@ if __name__ == "__main__":
             logging.info(f"انتهت الجولة. في انتظار {args.interval_hours} ساعة للجولة القادمة...")
             time.sleep(args.interval_hours * 3600)
     else:
-        execute_pipeline(results_per_query=args.limit)
+        execute_pipeline(results_per_query=args.limit)    
